@@ -32,14 +32,16 @@ FUEL_ROTATE        = 0.1
 FUEL_REFUEL_COST   = 30       
 FUEL_REFUEL_AMOUNT = 300 
 
-MAX_IDLE_STEPS = 10_000
+MAX_IDLE_STEPS = 5_000
 
-N_AGENTS = 5
+N_AGENTS = 10
 
 # Rewards
-R_HARVEST_WHEAT_STAGE_3      = +1.0
-R_HARVEST_WHEAT_STAGE_1_OR_2 = -1.0
-R_CARRY_WHEAT_TO_DELIVERY     = +5.0
+R_HARVEST_WHEAT_STAGE_3        = +1.0
+R_HARVEST_WHEAT_STAGE_1_OR_2   = -1.0
+R_HARVEST_WHEAT_STAGE_3_GREEDY = -1.0
+R_CARRY_WHEAT_TO_DELIVERY      = +5.0
+R_REFUEL_NO_MONEY              = -1.0
 
 # Colors
 C_BG          = (15,   20,  15)
@@ -68,6 +70,7 @@ C_AGENT_COLORS = [
     (90,   30, 120),
     (30,   80, 160),
     (200,  60,  90),
+    (200, 180,  90),
     (90,   60, 200), 
     (60,  180,  75),  
 ]
@@ -93,12 +96,41 @@ def _generate_small_blocks(big_block, block_size=BLOCK_SIZE, spacing=SPACE):
                 big_block.y + i*(block_size+spacing),
                 block_size, block_size 
             ))
-
     return out
 
 ALL_WHEAT_RECTS = []
 for big_block in BIG_BLOCKS:
     ALL_WHEAT_RECTS.extend(_generate_small_blocks(big_block))
+
+# Rays
+N_RAYS     = 360
+MAX_DIST   = 300.0
+RAY_ANGLES = np.linspace(0, 2 * np.pi, N_RAYS, endpoint=False).astype(np.float32)
+
+_WR  = np.array([[r.x, r.y, r.x + r.width, r.y + r.height]
+                  for r in ALL_WHEAT_RECTS], dtype=np.float32)
+_WX0, _WY0, _WX1, _WY1 = _WR[:, 0], _WR[:, 1], _WR[:, 2], _WR[:, 3]
+
+OBS_SIZE  = 8 + N_RAYS * 2
+N_ACTIONS = 6
+
+def _ray_aabb_intersect(ox, oy, dx, dy, x0, y0, x1, y1):
+    EPS = 1e-8
+    safe_dx = np.where(np.abs(dx) > EPS, dx, EPS)
+    safe_dy = np.where(np.abs(dy) > EPS, dy, EPS)
+    
+    inv_dx = 1.0 / safe_dx
+    inv_dy = 1.0 / safe_dy
+    
+    tx0 = (x0 - ox) * inv_dx
+    tx1 = (x1 - ox) * inv_dx
+    ty0 = (y0 - oy) * inv_dy
+    ty1 = (y1 - oy) * inv_dy
+    
+    t_enter = np.maximum(np.minimum(tx0, tx1), np.minimum(ty0, ty1))
+    t_exit  = np.minimum(np.maximum(tx0, tx1), np.maximum(ty0, ty1))
+    hit     = (t_exit >= 0) & (t_enter <= t_exit) & (t_enter >= 0)
+    return np.where(hit, t_enter, np.inf)
 
 # ────────────────────────────────────────────────────────────────
 # KEYBOARD
@@ -226,6 +258,7 @@ class FarmAgent:
 
     def step(self, action):
         done = False
+        reward = 0.0
         self.idle_steps += 1
 
         speed = 3
@@ -246,16 +279,38 @@ class FarmAgent:
             if action == 3:
                 self.angle = (self.angle + 45) % 360
                 self.fuel -= FUEL_ROTATE
-        if action == 4 and self.money >= FUEL_REFUEL_COST:
-            self.money -= FUEL_REFUEL_COST
-            self.fuel = min(self.fuel + FUEL_REFUEL_AMOUNT, MAX_FUEL)
+        if action == 4:
+            if self.money >= FUEL_REFUEL_COST:
+                self.money -= FUEL_REFUEL_COST
+                self.fuel = min(self.fuel + FUEL_REFUEL_AMOUNT, MAX_FUEL)
+            else:
+                reward += R_REFUEL_NO_MONEY
 
         self.x = max(0, min(PLAY_WIDTH - TRACTOR_SIZE, self.x))
         self.y = max(0, min(HEIGHT - TRACTOR_SIZE, self.y))
 
+        state = self.get_state()
+
         if self.idle_steps > MAX_IDLE_STEPS:
             done = True
-        return done
+        return state, reward, done
+
+    def get_state(self):
+        normalized_x         = self.x / PLAY_WIDTH
+        normalized_y         = self.y / HEIGHT
+        normalized_fuel      = self.fuel / MAX_FUEL
+        normalized_wheat     = self.wheat_carried / MAX_WHEAT_CAN_CARRY
+        delta_x              = (self.x - DELIVERY_RECT.centerx) / PLAY_WIDTH
+        delta_y              = (self.y - DELIVERY_RECT.centery) / HEIGHT
+        delivery_vector      = np.array([delta_x, delta_y])
+        angle_radians        = math.radians(self.angle)
+        forward_vector       = np.array([math.cos(angle_radians), math.sin(angle_radians)])
+        side_vector          = np.array([-math.sin(angle_radians), math.cos(angle_radians)])
+        dot_forward          = np.dot(delivery_vector, forward_vector)
+        dot_side             = np.dot(delivery_vector, side_vector)
+        return np.array([normalized_x, normalized_y, 
+                         normalized_fuel, normalized_wheat, 
+                         delta_x, delta_y, dot_forward, dot_side])
 
 class FarmEnvironment:
     def __init__(self):
@@ -270,7 +325,6 @@ class FarmEnvironment:
     def update_wheat(self):
         for idx in self.wheat_states:
             stage = self.wheat_states[idx]
-
             if stage == 1 and random.random() < WHEAT_GROW_1_TO_2:
                 self.wheat_states[idx] = 2
             elif stage == 2 and random.random() < WHEAT_GROW_2_TO_3:
@@ -283,9 +337,11 @@ class FarmEnvironment:
             stage = self.wheat_states[idx]
             if stage > 0 and agent_rect.colliderect(wheat_rect):
                 if stage == 3:
-                    agent.wheat_carried += 1
-                    agent.wheat_carried = min(MAX_WHEAT_CAN_CARRY, agent.wheat_carried)
-                    reward += R_HARVEST_WHEAT_STAGE_3
+                    if agent.wheat_carried == MAX_WHEAT_CAN_CARRY:
+                        reward += R_HARVEST_WHEAT_STAGE_3_GREEDY
+                    else:
+                        agent.wheat_carried += 1
+                        reward += R_HARVEST_WHEAT_STAGE_3
                 else:
                     reward += R_HARVEST_WHEAT_STAGE_1_OR_2
                 self.wheat_states[idx] = 0
@@ -298,7 +354,7 @@ class FarmEnvironment:
             earned = agent.wheat_carried * 10
             agent.money += earned
             reward += R_CARRY_WHEAT_TO_DELIVERY * agent.wheat_carried
-            agent.wheat_carried   = 0
+            agent.wheat_carried = 0
         return reward
 
     def step_environment(self, agent):
@@ -313,18 +369,15 @@ class FarmEnvironment:
 class Renderer:
     def __init__(self):
         pg.init()
-
         self.window = pg.display.set_mode((WIDTH, HEIGHT))
         self.clock = pg.time.Clock()
-
         self.font_small = pg.font.SysFont("monospace", 11)
         self.font_bold = pg.font.SysFont("monospace", 16, bold=True)
-
+        self._ray_surf  = pg.Surface((PLAY_WIDTH, HEIGHT), pg.SRCALPHA)
         self.action_cooldown = 0
 
     def get_human_action(self):
         self.action_cooldown -= 1
-
         keys = pg.key.get_pressed()
         action = keys_to_actions(keys)
         if action in (2, 3, 4) and self.action_cooldown > 0:
@@ -354,7 +407,6 @@ class Renderer:
         rect = agent.rect
         pg.draw.rect(self.window, color, rect, border_radius=4)
         pg.draw.rect(self.window, C_TRACTOR_EDG, rect, 1, border_radius=4)
-
         radians    = math.radians(agent.angle)
         center_x, center_y = rect.centerx, rect.centery
         size1  = TRACTOR_SIZE / 4
@@ -364,7 +416,6 @@ class Renderer:
         left   = (center_x + size1 * math.cos(radians + angle_120), center_y + size1 * math.sin(radians + angle_120))
         right  = (center_x + size1 * math.cos(radians - angle_120), center_y + size1 * math.sin(radians - angle_120))
         pg.draw.polygon(self.window, C_ARROW, [tip, left, right])
-
         label = self.font_small.render(str(index), True, (255, 255, 255))
         self.window.blit(label, (rect.x + 2, rect.y + 2))
     
@@ -375,8 +426,50 @@ class Renderer:
         edge = tuple(max(0, value - 30) for value in color)
         pg.draw.rect(self.window, edge, rect, 1, border_radius=2)
 
-    
-    def draw(self, agents, environment):
+    def _draw_rays(self, agents, wheat_states):
+        self._ray_surf.fill((0, 0, 0, 0))
+        active_indices = [i for i, s in wheat_states.items() if s > 0]
+        if active_indices:
+            ax0 = _WX0[active_indices]
+            ay0 = _WY0[active_indices]
+            ax1 = _WX1[active_indices]
+            ay1 = _WY1[active_indices]
+
+        for agent in agents:
+            cx = agent.x + TRACTOR_SIZE / 2
+            cy = agent.y + TRACTOR_SIZE / 2
+
+            all_angles = math.radians(agent.angle) + RAY_ANGLES 
+            dx_arr = np.cos(all_angles)[:, None]                  
+            dy_arr = np.sin(all_angles)[:, None]                 
+
+            if active_indices:
+                t_vals = _ray_aabb_intersect(cx, cy, dx_arr, dy_arr, ax0, ay0, ax1, ay1)  
+                closest_wheat_idx = np.argmin(t_vals, axis=1)               
+                closest_t = t_vals[np.arange(N_RAYS), closest_wheat_idx]    
+            else:
+                closest_t = np.full(N_RAYS, np.inf)
+                closest_wheat_idx = np.zeros(N_RAYS, dtype=int)
+
+            dx_arr = dx_arr[:, 0]  
+            dy_arr = dy_arr[:, 0]
+
+            for r in range(N_RAYS):
+                t = closest_t[r]
+                hit = t <= MAX_DIST
+                if hit:
+                    hit_stage = wheat_states[active_indices[closest_wheat_idx[r]]]
+                    col = C_RAY_HIT if hit_stage == 3 else (200, 200, 80, 80)
+                    ex, ey = cx + dx_arr[r] * t, cy + dy_arr[r] * t
+                else:
+                    col = C_RAY_MISS
+                    ex, ey = cx + dx_arr[r] * MAX_DIST, cy + dy_arr[r] * MAX_DIST
+                pg.draw.line(self._ray_surf, col, (int(cx), int(cy)), (int(ex), int(ey)), 1)
+
+        self.window.blit(self._ray_surf, (0, 0))
+            
+
+    def draw(self, agents, environment, steps):
         window = self.window
         window.fill(C_BG)
 
@@ -386,6 +479,9 @@ class Renderer:
 
         pg.draw.rect(window, C_DELIVERY_BG, DELIVERY_RECT, border_radius=6)
         pg.draw.rect(window, C_DELIVERY, DELIVERY_RECT, 2, border_radius=6)
+
+        self._draw_rays(agents, environment.wheat_states)
+
         delivery_label1 = self.font_small.render("DELIVER", True, C_DELIVERY)
         window.blit(delivery_label1, (DELIVERY_RECT.centerx - 28, DELIVERY_RECT.centery - 10))
         delivery_label2 = self.font_small.render("here →$", True, C_DELIVERY)
@@ -398,11 +494,11 @@ class Renderer:
         y_pos = 15
         separator = self.font_small.render("─" * 30, True, (50, 70, 50))
         window.blit(separator, (panel_x, y_pos)); y_pos += 18
-
         episode = 0
         total_wheat = 0
         window.blit(self.font_bold.render(f"Episode:   {episode}", True, C_TEXT), (panel_x, y_pos)); y_pos += 20
         window.blit(self.font_bold.render(f"Total WT:  {total_wheat} / {WHEAT_TOTAL_GOAL}", True, C_TEXT), (panel_x, y_pos)); y_pos += 20
+        window.blit(self.font_bold.render(f"Idle:  {steps} / {MAX_IDLE_STEPS}", True, C_TEXT), (panel_x, y_pos)); y_pos += 20
         window.blit(separator, (panel_x, y_pos)); y_pos += 18
 
         for agent_index, agent in enumerate(agents):
@@ -411,8 +507,7 @@ class Renderer:
             window.blit(self.font_bold.render(f"Agent {agent_tag}", True, agent_color), (panel_x, y_pos)); y_pos += 18
             self._draw_bar(panel_x, y_pos, 120, 10, agent.fuel / MAX_FUEL, C_FUEL_BAR, C_FUEL_LOW, label=f"Fuel {int(agent.fuel)}")
             y_pos += 16
-            window.blit(self.font_small.render(f"  $Money: {agent.money}", True, C_TEXT_DIM), (panel_x, y_pos)); y_pos += 16
-            window.blit(self.font_small.render(f"  Idle: {agent.idle_steps}/{MAX_IDLE_STEPS}", True, C_TEXT_DIM), (panel_x, y_pos)); y_pos += 16
+            window.blit(self.font_small.render(f"  Money: ${agent.money}", True, C_TEXT_DIM), (panel_x, y_pos)); y_pos += 16
             window.blit(self.font_small.render(f"  Wheat: {agent.wheat_carried}/{MAX_WHEAT_CAN_CARRY}", True, C_TEXT_DIM), (panel_x, y_pos)); y_pos += 16
             window.blit(separator, (panel_x, y_pos)); y_pos += 16
             self._draw_tractor(agent, agent_color, agent_index)
@@ -422,46 +517,40 @@ class Renderer:
 
     def close(self):
         pg.quit()
+
 # ────────────────────────────────────────────────────────────────
 #  TRAINING LOOP
 # ────────────────────────────────────────────────────────────────
 
 def train():
-    environment         = FarmEnvironment()
+    environment = FarmEnvironment()
     agents      = []
     ai_agents   = [FarmAgent(i+1) for i in range(N_AGENTS)]
     human_agent = FarmAgent('YOU')
     agents.append(human_agent)
     agents.extend(ai_agents)
     renderer = Renderer()
-
     running = True
 
     while running:
         running = renderer.poll_events()
         if not running:
             break
-
         environment.update_wheat()
-
         action = renderer.get_human_action()
-        done = human_agent.step(action)
+        state_h, reward_h, done_h = human_agent.step(action)
         reward = environment.step_environment(human_agent)
-
         for agent in ai_agents:
             action = random.randint(0, 4)
-            agent.step(action)
+            state_ai, reward_ai, done_ai = agent.step(action)
             reward = environment.step_environment(agent)
-
-        renderer.draw(agents, environment)
-
-        if done:
+        renderer.draw(agents, environment, human_agent.idle_steps)
+        if done_h:
+            environment.regrow_wheat()
             human_agent.reset()
             for agent in ai_agents:
                 agent.reset()
-
         pg.display.set_caption(f"FPS: {renderer.clock.get_fps():.2f}")
-
     renderer.close()
     print("Goodbye.")
 
